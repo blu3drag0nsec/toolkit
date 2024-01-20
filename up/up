@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+# Title: UP HTTP Server
+# Author: AG | MuirlandOracle
+# Date: 2022-09-26
+
+import argparse
+import os
+import json
+import re
+import random
+import netifaces
+import colorsys
+import threading
+import logging
+from rich.console import Console
+from rich.columns import Columns
+from rich.table import Table
+from datetime import datetime
+from werkzeug.middleware.proxy_fix import ProxyFix
+from flask import Flask, send_from_directory, request, cli
+
+
+
+##### Network Interface Interaction #####
+class Interfaces():
+    """Network Interfaces Class
+    Wrapper around netifaces library to obtain all IP addresses assigned to interfaces on the system and store these for easy processing.
+    
+    Attributes:
+    - workingIP: string
+        - The current IP address stored in the object. Defaults to 0.0.0.0
+    - interfaces: dict
+        - A dictionary containing interfaces to addresses
+        - e.g.: {"eth0":["192.168.0.1","192.168.0.2"]}
+        - Interfaces are unlikely to have more than one address, but the functionality to handle it is there
+    - addresses: dict
+        - Quick lookup dictionary containing addresses to interfaces
+        - e.g.: {"192.168.0.1":"eth0"}
+
+    """
+    def __init__(self: object):
+        "Initialise Class, including obtaining all addresses using netifaces"
+        self.workingIP = "0.0.0.0" # Default to all interfaces
+        self.interfaces = {}
+        self.addresses = {}
+
+        # Extract interfaces
+        interfaces = netifaces.interfaces()
+        for i in interfaces:
+            interface = netifaces.ifaddresses(i).get(netifaces.AF_INET)
+            if interface != None:
+                currInterface = []
+                for link in interface:
+                    currInterface.append(link["addr"])
+                    self.addresses[link["addr"]] = i
+                self.interfaces[i] = currInterface
+
+    def setAddress(self: object, addr: str="0.0.0.0") -> bool:
+        """- Takes a string argument and validates that it corresponds to an address in use by the machine
+        - Sets the validated address to self.workingIP if successful
+        - Returns whether validation was successful
+
+        """
+        if addr in self.interfaces.keys(): # i.e. did they submit a valid interface
+            self.workingIP = self.interfaces.get(addr)[0] # Select the first address from the interface
+            return True
+        elif addr in self.addresses.keys() or addr == "0.0.0.0": # i.e. they submitted an IP address
+            self.workingIP = addr
+            return True
+        else:
+            return False
+            
+
+    def getPossibleAddresses(self: object) -> dict:
+        "Returns a list of possible access addresses based on whether the workingIP is 0.0.0.0 or not"
+        if self.workingIP == "":
+            return {}
+        elif self.workingIP == "0.0.0.0":
+            return self.interfaces
+        else:
+            return {self.addresses[self.workingIP]: [self.workingIP]}
+
+
+
+##### Helper Functions #####
+def renderTable(title: str, cols: list, arr: list):
+    "Render a multidict into a table. Internal use only"
+    t = Table(title=title)
+    for i in cols:
+        t.add_column(i, overflow="fold")
+    for i in arr:
+        t.add_row(*i)
+    return t
+
+def getBody():
+    "Obtain and parse the request body. Internal use only"
+    if request.headers.get("Content-Type") == "application/json":
+        try:
+            data = request.json
+        except:
+            data = {}
+    else:
+        data = tuple([(k,v) for k,v in request.form.items()])
+    return data
+
+class Colours():
+    """Colours Class
+    Tracks the last colour generated to ensure variance and exposes generateRGB to create a CSS-style RGB random colour
+
+    """
+    def __init__(self):
+        self.last = -1.0
+        self.variance = 0.2
+
+    def generateRGB(self):
+        "Generate a random RGB colour and store it to ensure variance"
+        hue = random.random()
+        # Ensure that the hue is not within the variance (0.2 by default) to either side of the last hue
+        while (hue > (self.last - self.variance)) and (hue < (self.last + self.variance)):
+            hue = random.random()
+        
+        self.last = hue
+        # Shoutout @Sam1ser for this one -- https://github.com/Samiser/pfp-colour-changer/blob/main/main.py
+        return f"rgb({','.join(str(round(i*255)) for i in colorsys.hsv_to_rgb(hue, 0.3, 0.95))})"
+
+
+
+##### Output Files #####
+class LogRequests():
+    """LogRequests Class
+    Used to output all data to files on disk
+    
+    Attributes:
+    - outDir
+        - Directory to write the files to
+    - config
+        - ServerConfig object -- should be passed in from a calling UpServer object
+
+    """
+    def __init__(self:object, config):
+        """Initialise LogRequests Object
+
+        Takes three arguments:
+        - outDir: string
+            - Root Directory to write output to. Must be located somewhere you have permission to write to.
+            - Default: "./up-output"
+
+        """
+        self.config = config # TODO: Add config checks after splitting classes out
+        self.initialised = False # Store whether the root dir has been created
+
+
+    def createRootDir(self: object) -> None:
+        """Attempt to create the root directory for output
+        Fails with PermissionError if you can't write to that directory, or a FileExistsError if the outDir exists and is not a directory
+
+        """
+        if self.config.output == None:
+            raise Exception("No output set in config")
+
+        try:
+            os.mkdir(self.config.output)
+        except FileExistsError:
+            if not os.path.isdir(self.config.output):
+                raise FileExistsError(f"{self.config.output} exists and is not a directory")
+            elif not os.access(self.config.output, os.W_OK):
+                raise PermissionError(f"{self.config.output} exists and is not writeable")
+        except PermissionError:
+            raise PermissionError(f"You don't have permission to write to {self.config.output}")
+
+        self.initialised = True
+
+    def createEntry(self: object, r: request, reqString: str) -> bool:
+        """Log an entry into the logging directory
+        Takes a Flask Request object and the request string as parameters -- everything else is via config
+
+        """
+        if not self.initialised:
+            return False
+        
+
+        dirName = re.sub("(?:\?[^ ]+ )", " ", reqString) # Remove query strings
+        dirName = dirName.replace("/", "_").\
+                            replace("[","").\
+                            replace("]","").\
+                            replace(" ","-").\
+                            replace("--","-").\
+                            replace('"', "").rstrip("-")
+        sanitisationRegex = re.compile("[^A-Za-z0-9]")
+        dirPath = f"{self.config.output}/{dirName}"
+        os.mkdir(dirPath) # If this fails then it's because you've done something dumb with the logging directory
+
+        
+        with open(f"{dirPath}/headers.txt", "w") as f:
+            c = Console(file=f)
+            if not self.config.accessible:
+                c.print(renderTable("", ["Header", "Value"], request.headers))
+            else:
+                for i in request.headers:
+                    c.print(f"{i[0]}: {i[1]}")
+
+
+        # Handle Data
+        data = getBody()
+        if type(data) == dict:
+            with open(f"{dirPath}/body.json", "w") as f:
+                json.dumps(data, indent=4)
+        elif len(data) > 0:
+            with open(f"{dirPath}/body.txt", "w") as f:
+                c = Console(file=f)
+                if not self.config.accessible:
+                    c.print(renderTable("", ["Key", "Value"], data))
+                else:
+                    for i in data:
+                        c.print(f"{i[0]}: {i[1]}")
+
+            for i in data:
+                if len(i[1]) > 50: # If the length is greater than 50, write it to the disk separately for easy access
+                    with open(f"{dirPath}/body-param-{re.sub(sanitisationRegex,'',i[0])}.txt", "w") as f:
+                        f.write(i[1])
+
+
+        # Handle query parameters
+        args = tuple([(i,v) for i,v in request.args.items()])
+        if len(args) > 0:
+            with open(f"{dirPath}/query-params.txt", "w") as f:
+                c = Console(file=f)
+                if not self.config.accessible:
+                    c.print(renderTable("", ["Key", "Value"], args))
+                else:
+                    for i in args:
+                        c.print(f"{i[0]}: {i[1]}")
+
+            for i in args:
+                if len(i[1]) > 50:
+                    with open(f"{dirPath}/query-param-{re.sub(sanitisationRegex,'',i[0])}.txt", "w") as f:
+                        f.write(i[1])
+
+        # Handle Files
+        if len(request.files) > 0:
+            filesDirPath = f"{dirPath}/uploadedFiles"
+            os.mkdir(filesDirPath)
+            for i in request.files:
+                uf = request.files.get(i)
+                uf.save(f"{filesDirPath}/{uf.filename}")
+        return True
+
+
+
+
+##### HTTP Server #####
+class ServerConfig():
+    """ServerConfig Class
+    Stores config for the UpServer class
+
+    Can take kwargs on initialisation to overwrite default values
+    Example of using this with argparse:
+    config = ServerConfig(**args.__dict__)
+
+    """
+    def __init__(self, **kwargs):
+        self.verbose = True
+        self.port = 80
+        self.ssl_context = None
+        self.msg = ""
+        self.directory = os.getcwd()
+        self.output = None
+        self.ignore = "ignore"
+        self.no_serve = False
+        self.accessible = False
+        self.no_colour = False
+        self.proxies = 0
+        self.enable_cors = False
+
+        for key, value in kwargs.items():
+            if key in self.__dict__ and value != None:
+                setattr(self, key, value)
+
+        # Check ssl related args and set ssl context
+        if kwargs.get("https"):
+            if kwargs.get("cert") and kwargs.get("key"):
+                self.ssl_context = (kwargs.get("cert"), kwargs.get("key"))
+            else:
+                self.ssl_context = "adhoc"
+            if not kwargs.get("port"):
+                self.port = 443 # Default to port 443 if we're using HTTPS
+
+
+        # Accessible means that colour should be disabled as well
+        self.no_colour = True if self.accessible else self.no_colour
+
+    def __str__(self):
+        return f"""<UpServerConfig: {self.__dict__}>"""
+
+class UpServer():
+    """
+    UpServer: The main class of the "UP" HTTP Tool
+    https://github.com/MuirlandOracle/up-http-tool
+
+    This class allows you to customise and extend the tool.
+    It uses the ServerConfig class to store configuration internally at UpServer.config. As such, the following dissassembled initialisation sequence should work:
+    server = UpServer(Interfaces(), noCreateApp=True) # Create an instance without generating the Flask application
+    server.config.port = 8080 # Example changing config
+    app = server.createApp() # Create the Flask application with the updated config without storing the app inside the object
+    server.start(app=app) # Pass the generated Flask app into the server
+
+    Pass an object (e.g. ServerConfig or argparse.Namespace, etc) into the initialisation process to adjust default args.
+
+    """
+    def __init__(self:object, interfaces:Interfaces, args = None, noCreateApp:bool = False):
+        self.interfaces = interfaces
+        self.mutex = threading.Lock() # Mutex to protect the console should multiple requests come in simultaneously
+        # Parse arguments into a server config
+        if args == None: # Default arguments
+            self.config = ServerConfig()
+        elif not hasattr(args, "__dict__"): # If the object attribute can't be turned into a dict then it's not correct
+            raise Exception("Invalid args object passed to UpServer")
+        else:
+            self.config = ServerConfig(**args.__dict__)
+
+        # Initialise Log
+        self.log = LogRequests(self.config)
+
+        # Initialise Colours Handler
+        self.colours = Colours()
+
+        # Create app if requested
+        if not noCreateApp:
+            self.app = self.createApp()
+
+        # Enable Logging if requested
+        if self.config.output != None:
+            self.log.createRootDir()
+
+
+    def printInfo(self:object, quiet=False):
+        """Print information about the running configuration
+        e.g. serve directory, interfaces, etc
+
+        The "quiet" argument disables line breaks
+
+        """
+        headerstyle = "\n[bold underline]{}[/bold underline]"
+        self.mutex.acquire()
+        c = Console(highlight=False)
+        if not (self.config.accessible or quiet):
+            c.rule("Information")
+        if not self.config.no_serve: # No point in printing this if we're not serving files
+            c.print(headerstyle.format("Directory"))
+            c.print(self.config.directory)
+            c.print(headerstyle.format("Files"))
+            c.print(Columns(os.listdir(self.config.directory)))
+        c.print(headerstyle.format("Interfaces"))
+        for i in self.interfaces.getPossibleAddresses().items():
+            for addr in i[1]:
+                c.print(f"{i[0]}: [italic]{addr}[/ italic]") 
+        c.print()
+        if not (self.config.accessible or quiet):
+            c.rule()
+        self.mutex.release()
+
+
+
+    def createApp(self:object):
+        "Create the Flask application based on instance configuration"
+        app = Flask(__name__)
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=self.config.proxies, x_host=self.config.proxies)
+
+        # Handle GET requests 
+        @app.route("/", defaults={"path":""})
+        @app.route('/<path:path>')
+        def sendFile(path):
+            if not self.config.no_serve:
+                return send_from_directory(self.config.directory, path)
+            else:
+                return self.config.msg
+                
+
+        # Handle all other request methods
+        @app.errorhandler(405)
+        def catchall(e):
+            return self.config.msg, 200
+        
+        # Relax SOP restrictions if requested  -- let's be honest, we don't need 'em anyway
+        if self.config.enable_cors:
+            @app.after_request
+            def enableCors(r):
+                r.headers["Access-Control-Allow-Origin"] = request.origin or "*"
+                r.headers["Access-Control-Allow-Method"] = "*"
+                r.headers["Access-Control-Allow-Credentials"] = "true"
+                r.headers["Access-Control-Expose-Headers"] = "*"
+                r.headers["Access-Control-Allow-Headers"] = request.headers.get("Access-Control-Request-Headers") or "*"
+                return r
+
+
+        @app.after_request
+        def printHeaders(r):
+            self.mutex.acquire()
+            c = Console(style=self.colours.generateRGB() if not self.config.no_colour else "", highlight=False)
+            reqString = f"""{request.remote_addr} - - [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "{request.method} {request.full_path.rstrip('?')} {request.environ.get('SERVER_PROTOCOL')}" {r.status_code} -"""
+            c.print(f"""{"=============================================" + chr(10) if self.config.verbose and not (self.config.accessible or self.config.ignore) else ""}{reqString}""")
+            if self.config.verbose and self.config.ignore not in request.args:
+                if not self.config.accessible:
+                    c.print(renderTable("", ["Header", "Value"], request.headers))
+                else:
+                    c.print("Headers:")
+                    for i in request.headers:
+                        c.print(f" {i[0]}: {i[1]}")
+
+                # Handle Data
+                data = getBody()
+                if len(data) > 0:
+                    c.print("[bold underline]Body:[/ bold underline]")
+                    if type(data) == dict:
+                        c.print_json(data=data, highlight=(not self.config.no_colour))
+                    elif not self.config.accessible:
+                        c.print(renderTable("", ["Key", "Value"], data))
+                    else:
+                        for i in data:
+                            c.print(f" {i[0]}: {i[1]}")
+
+
+                # Handle query parameters
+                args = tuple([(i,v) for i,v in request.args.items()])
+                if len(args) > 0:
+                    c.print("[bold underline]Query Parameters:[/ bold underline]")
+                    if not self.config.accessible:
+                        c.print(renderTable("", ["Key", "Value"], args))
+                    else:
+                        for i in args:
+                            c.print(f" {i[0]}: {i[1]}")
+
+                # Check for files
+                if len(request.files) > 0:
+                    c.print(f"{len(request.files)} {'file was' if len(request.files) == 1 else 'files were'} received. ", end="")
+                    if self.config.output != None:
+                        c.print(f"{'These files were' if len(request.files) > 1 else 'File'} saved in your output directory")
+                    else:
+                        c.print(f"Output is disabled. {'Files were' if len(request.files) > 1 else 'File'} not saved")
+            self.mutex.release()
+            # Handle Logging
+            if self.config.output != None and self.config.ignore not in request.args:
+                self.log.createEntry(request, reqString)
+            return r
+        return app
+
+    def start(self, quiet=False, app = None):
+        "Start the application based on either the instance's internal Flask app (if it exists) or a custom version passed into the 'app' parameter"
+        # Get the app
+        if isinstance(app, Flask):
+            workingApp = app
+        elif hasattr(self, "app") and isinstance(self.app, Flask):
+            workingApp = self.app
+        else:
+            raise Exception("No valid Flask application found")
+            
+        if not quiet:
+            self.printInfo(quiet=True)
+            if not self.config.ssl_context:
+                proto = "http"
+            else:
+                proto = "https"
+            print(f"Serving on {proto}://{self.interfaces.workingIP}:{self.config.port}")
+
+        # Disable flask logging
+        logging.getLogger('werkzeug').disabled = True
+        cli.show_server_banner = lambda *args: None
+
+        threading.Thread(target=lambda: workingApp.run(port=self.config.port, host=self.interfaces.workingIP, ssl_context=self.config.ssl_context), daemon=True).start() # Run the HTTP server in the background so that the enter-for-info works
+        while True:
+            try:
+                input()
+            except KeyboardInterrupt:
+                exit()
+            self.printInfo()
+
+
+##### Argument Parsing #####
+def validAddress(interfaces: Interfaces, addr: str="0.0.0.0"): # Validate that the requested IP address / interface is suitable to bind the server to
+    if interfaces.setAddress(addr):
+        return interfaces.workingIP
+    else:
+        raise argparse.ArgumentTypeError(f"'{addr}' is not a valid IP address or interface  assigned to this machine") 
+    
+def positiveInt(x):
+    try:
+        x = int(x)
+        assert(x>=0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--proxies argument: '{x}', is not an integer")
+    except AssertionError:
+        raise argparse.ArgumentTypeError(f"Argument for --proxies must be greater than or equal to 0")
+    return x
+
+
+def parseUpArgs(interfaces: Interfaces) -> argparse.Namespace:
+    """parseUpArgs
+    Argument parser compatible with the UpServer default ServerConfig
+
+    Takes an Instances object to validate the chosen IP address and store it within the instance.
+
+    """
+    parser = argparse.ArgumentParser(description="UP Simple HTTP server for debugging / hacking")
+    parser.add_argument("-v", "--verbose", help="Show request headers / information (you probably want this active)", action="store_true")
+    parser.add_argument("-q", "--quiet", help="Don't show information on startup", action="store_true")
+    parser.add_argument("-p", "--port", help="The port to serve on. Defaults to port 80 if HTTP, else 443")
+    parser.add_argument("-i", "--ip", help="The IP to serve on. Defaults to all interfaces (0.0.0.0)", default="0.0.0.0", type=lambda addr: validAddress(interfaces, addr))
+    parser.add_argument("--https", help="Run HTTPS server.", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--cert", help="Path to the certificate file.", default=None)
+    parser.add_argument("--key", help="Path to the key file.", default=None)
+    parser.add_argument("-m", "--msg", help="Message to respond to non-GET requests with. Defaults to ''.", default="")
+    parser.add_argument("--proxies", help="Number of proxies in front of the tool. Defaults to 0", type=positiveInt, default=0)
+    parser.add_argument("-o","--output", help="Directory to output request data to. Disabled by default")
+    parser.add_argument("--ignore", help="Query parameter which tells UP to ignore verbosity and logging for the request. Defaults to 'ignore' (e.g. `/file?ignore`).")
+
+    dirGrp = parser.add_mutually_exclusive_group() # Directory arguments
+    dirGrp.add_argument("-d", "--directory", help="Directory to serve files from. Defaults to current working directory", default=os.getcwd())
+    dirGrp.add_argument("--no-serve", help="Do not serve files", action="store_true")
+
+
+    accessGrp = parser.add_mutually_exclusive_group() # Colour parsing -- if accessible is specified then they both must be, no point in allowing them both to be specified
+    accessGrp.add_argument("--accessible", action="store_true", help="Disable ASCII art (automatically adds --no-colour)")
+    accessGrp.add_argument("-c","--no-colour", action="store_true", help="Disable colour printing")
+
+    parser.add_argument("-ec", "--enable-cors", help="Add headers to enable CORS (relax browser same-origin policy requirements)", action="store_true")
+
+    return parser.parse_args()
+
+
+
+##### Start the App #####
+if __name__ == "__main__":
+    # Initialise Interfaces
+    interfaces = Interfaces()
+    
+    # Parse arguments
+    args = parseUpArgs(interfaces)
+
+    # Start app
+    server = UpServer(interfaces, args=args)
+    server.start(quiet=args.quiet)
